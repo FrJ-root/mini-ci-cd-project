@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DevOps Project: Public WebApp + Private DB + Monitoring'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: devops-project-key
+  
+  AlertEmail:
+    Description: Email address for SNS alerts
+    Type: String
+    Default: replace.me@example.com  # <--- GitHub Actions will overwrite this, but change it here if testing manually
+
+Resources:
+  # --- NETWORK (VPC) ---
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: DevOps-VPC}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: "us-east-1a"
+      Tags: [{Key: Name, Value: Public-Subnet}]
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: "us-east-1a"
+      Tags: [{Key: Name, Value: Private-Subnet}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref MyVPC}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- SECURITY GROUPS ---
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SQL only from WebApp
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+
+  # --- EC2 INSTANCES ---
+  DBInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-04b4f1a9cf54c11d0 # Ubuntu 24.04 LTS (Region: us-east-1)
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: [!Ref DBSecurityGroup]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y mysql-server
+          sed -i 's/bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+          systemctl restart mysql
+          mysql -e "CREATE USER 'admin'@'%' IDENTIFIED BY 'admin123';"
+          mysql -e "GRANT ALL PRIVILEGES ON *.* TO 'admin'@'%';"
+          mysql -e "FLUSH PRIVILEGES;"
+          # Create DB
+          mysql -e "CREATE DATABASE app_db;"
+          mysql -e "USE app_db; CREATE TABLE messages (id INT AUTO_INCREMENT PRIMARY KEY, message VARCHAR(255)); INSERT INTO messages (message) VALUES ('Hello from the Private Database!');"
+      Tags: [{Key: Name, Value: Private-DB}]
+
+  WebAppInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: DBInstance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-04b4f1a9cf54c11d0 # Ubuntu 24.04 LTS (Region: us-east-1)
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref WebSecurityGroup]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y apache2 php libapache2-mod-php php-mysql
+          rm /var/www/html/index.html
+          echo "export DB_HOST=${DBInstance.PrivateIp}" >> /etc/apache2/envvars
+          systemctl restart apache2
+          # Download App Code from FrJ-root repository
+          wget https://raw.githubusercontent.com/FrJ-root/mini-ci-cd-project/main/webapp/index.php -O /var/www/html/index.php
+      Tags: [{Key: Name, Value: Public-WebApp}]
+
+  # --- MONITORING (CloudWatch & SNS) ---
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CPU-Alert-Topic
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alert if CPU > 50%"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebAppInstance
+      AlarmActions:
+        - !Ref AlertTopic
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub "http://${WebAppInstance.PublicIp}"
+    Description: Access the App here
